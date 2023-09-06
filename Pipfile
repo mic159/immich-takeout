@@ -5,10 +5,12 @@ name = "pypi"
 
 [packages]
 requests = "~=2.31.0"
-exif = "~=1.6.0"
 rich = "~=13.5.2"
+pytz = "*"
+piexif = "~=1.1.3"
 
 [dev-packages]
+black = "*"
 
 [requires]
 python_version = "3.11"

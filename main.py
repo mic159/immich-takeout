@@ -1,92 +1,126 @@
+import itertools
 from collections.abc import Iterator
 import argparse
 import tarfile
 import os.path
+import os
+import re
+import io
+import math
 import json
-from typing import IO, BinaryIO
+from typing import BinaryIO, TypeVar
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import mimetypes
 import tempfile
+import hashlib
+from piexif import load, ExifIFD, insert, dump
 
-from exif import Image, DATETIME_STR_FORMAT
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+import pytz
 
-from plum.exceptions import UnpackError
 from rich.progress import (
     BarColumn,
     Progress,
-    MofNCompleteColumn,
     TextColumn,
     TimeElapsedColumn,
+    TimeRemainingColumn,
+    DownloadColumn,
+    TransferSpeedColumn,
 )
+
+DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
 
 
 def cli():
     parser = argparse.ArgumentParser(
-        description='CLI command to upload google takeout tars directly to immich without extracting'
+        description="CLI command to upload google takeout tars directly to immich without extracting"
     )
     parser.add_argument(
-        'files',
-        help='list of google taketout tar.gz files',
-        type=argparse.FileType('rb'),
-        nargs='+'
+        "files",
+        help="list of google taketout tar.gz files",
+        type=argparse.FileType("rb"),
+        nargs="+",
     )
+    parser.add_argument(
+        "--dry-run", help="Do not upload the images", action="store_true"
+    )
+    parser.add_argument("--api-key", help="API Key for Immich")
+    parser.add_argument("--api-url", help="URL for Immich")
     args = parser.parse_args()
 
-    tars = [
-        tarfile.open(fileobj=f)
-        for f in args.files
-    ]
+    tars = [tarfile.open(fileobj=f) for f in args.files]
 
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
-        MofNCompleteColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
         TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        expand=True,
     )
+
     with progress:
         upload_files(
             process_files(
-                extract_metadata(
-                    tars=tars,
-                    progress=progress
-                ),
-                progress=progress
+                extract_metadata(tars=tars, progress=progress), progress=progress
             ),
-            progress=progress
+            api_key=args.api_key,
+            api_url=args.api_url,
+            dry_run=args.dry_run,
+            progress=progress,
         )
 
 
-def extract_metadata(tars: list[tarfile.TarFile], progress: Progress) -> Iterator[tuple[str, BinaryIO, dict]]:
+def extract_metadata(
+    tars: list[tarfile.TarFile], progress: Progress
+) -> Iterator[tuple[str, BinaryIO, dict, int]]:
     metadata: dict[str, dict] = {}
     tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
     seen = set()
-    for tar in progress.track(tars, description="Tar files"):
+    metadata_progress = progress.add_task(description="metadata", total=None)
+    info_progress = progress.add_task(description="files", total=None)
+    for tar in progress.track(tars):
+        tar.fileobj = progress.wrap_file(
+            tar.fileobj,
+            total=os.path.getsize(tar.name),
+            description=os.path.basename(tar.name),
+        )
         tar_meta_files = 0
         tar_data_files = 0
-        progress.log(f"Processing [bold blue]{os.path.basename(tar.name)}")
-        for tarinfo in progress.track(iterate_tarfile(tar), description="Extracting files"):
+        tar_name = os.path.basename(tar.name)
+        progress.log(f"Processing [bold blue]{tar_name}")
+        for tarinfo in iterate_tarfile(tar):
             filename, ext = os.path.splitext(tarinfo.name)
-            if ext == '.json':
+            if ext == ".json":
                 data = json.load(tar.extractfile(tarinfo))
                 if filename in metadata or filename in seen:
                     progress.log(f"[red bold]❌ ERROR: Duplicate metadata found!!!")
                     progress.log(f"[red]  - filename: {filename}")
                     progress.log(f"[red]  - Tar: {tar.name}")
-                    progress.log(f"[red]  - In Metadata: {filename in metadata}, In seen {filename in seen}")
+                    progress.log(
+                        f"[red]  - In Metadata: {filename in metadata}, In seen {filename in seen}"
+                    )
                 metadata[filename] = data
                 tar_meta_files += 1
             else:
                 filename = tarinfo.name
                 tar_infos[filename] = (tar, tarinfo)
                 tar_data_files += 1
+            progress.update(metadata_progress, completed=len(metadata), total=None)
+            progress.update(info_progress, completed=len(tar_infos), total=None)
             if filename in tar_infos and filename in metadata:
                 archive, data_file_tarinfo = tar_infos[filename]
-                yield filename, archive.extractfile(data_file_tarinfo), metadata[filename]
+                yield filename, archive.extractfile(data_file_tarinfo), metadata[
+                    filename
+                ], data_file_tarinfo.size
                 del tar_infos[filename]
                 del metadata[filename]
                 seen.add(filename)
-        progress.log(f"Dangling metadata: {len(metadata)}, Dangling files: {len(tar_infos)}")
+        progress.log(
+            f"Dangling metadata: {len(metadata)}, Dangling files: {len(tar_infos)}"
+        )
 
     progress.log("Finished extracting files")
     progress.log(f"Num files: {len(seen)}")
@@ -96,80 +130,242 @@ def extract_metadata(tars: list[tarfile.TarFile], progress: Progress) -> Iterato
         progress.log(f"[yellow]⚠ Files dangling: {len(tar_infos)}")
 
 
-def process_files(iter: Iterator[tuple[str, BinaryIO, dict]], progress: Progress) -> Iterator[str, BinaryIO]:
-    skipped = set()
-    for filename, fle, data in progress.track(iter, description="Processing files"):
+def process_files(
+    iter: Iterator[tuple[str, BinaryIO, dict, int]], progress: Progress
+) -> Iterator[tuple[str, BinaryIO, int]]:
+    skipped = 0
+    for filename, fle, data, filesize in progress.track(
+        iter, description="Processing files"
+    ):
         # Filter to only your images
         if "fromPartnerSharing" in data.get("googlePhotosOrigin", {}):
-            skipped.add(filename)
-        if os.path.splitext(filename)[1].lower() not in ('.jpeg', '.jpg'):
-            yield filename, fle
+            skipped += 1
             continue
-        try:
-            image = Image(fle)
-        except UnpackError:
-            progress.log(f"[yellow]Error reading EXIF[/yellow], uploading anyway '{filename}'")
-            yield filename, fle
+        if os.path.splitext(filename)[1].lower() not in (".jpeg", ".jpg"):
+            yield filename, fle, filesize
             continue
 
-        try:
-            exif_time = datetime.strptime(image.datetime_original, DATETIME_STR_FORMAT)
-        except AttributeError:
-            try:
-                exif_time = datetime.strptime(image.datetime, DATETIME_STR_FORMAT)
-            except AttributeError:
-                exif_time = datetime.now()
-        metadata_time = datetime.fromtimestamp(int(data['photoTakenTime']['timestamp']))
+        orig_binary = fle.read()
+        exif_data = load(orig_binary)
 
-        if exif_time != metadata_time:
-            # skipped.add(fileinfo.name)
-            # progress.log(f"[yellow]Date incorrect[/yellow] {fileinfo.name}")
-            # progress.log(f"   - Diff: {exif_time - metadata_time}")
-            # progress.log(f"   - EXIF: {exif_time}")
-            # progress.log(f"   - Metadata: {metadata_time}")
-            image.datetime = metadata_time.strftime(DATETIME_STR_FORMAT)
-            image.datetime_original = metadata_time.strftime(DATETIME_STR_FORMAT)
-            with tempfile.TemporaryFile() as tmp:
-                tmp.write(image.get_file())
-                yield filename, tmp
+        needs_rewrite, new_timestamp = check_timestamp_exif(
+            exif_time=extract_exif_date(exif_data),
+            metadata_time=datetime.fromtimestamp(
+                int(data["photoTakenTime"]["timestamp"]), timezone.utc
+            ),
+        )
+        if needs_rewrite:
+            update_exif_data(exif_data, new_timestamp)
+            # Write out new file
+            tmp_fle = tempfile.NamedTemporaryFile("wb", suffix=".jpg")
+            insert(dump(exif_data), orig_binary, tmp_fle.name)
+            tmp_fle.seek(0, os.SEEK_END)
+            filesize = tmp_fle.tell()
+            tmp_fle.seek(0)
+            progress.log(f"EXIF updated {filename} - {filesize}")
+            yield filename, tmp_fle, filesize
         else:
-            yield filename, fle
-    progress.log(f"Skipped {len(skipped)}")
-
-    with open('skipped.json', 'w') as datfle:
-        json.dump(list(skipped), datfle)
+            # Good, emit directly
+            yield filename, fle, filesize
+    progress.log(f"Skipped {skipped}")
 
 
-def upload_files(files: Iterator[str, BinaryIO], progress: Progress):
-    for name, fle in files:
-        progress.log('Uploading...', name)
-        fle.seek(0)
-        response = requests.request(
-            'POST',
-            url='https://photos.apps.bitwarfare.net/api/asset/upload',
+T = TypeVar("T")
+
+
+def chunk_iterator(iterator: Iterator[T], size) -> Iterator[list[T]]:
+    items = []
+    for x in iterator:
+        items.append(x)
+        if len(items) >= size:
+            yield items
+            items = []
+    if len(items):
+        yield items
+
+
+def get_file_info(name: str, fle: BinaryIO, filesize: int) -> tuple[str, str]:
+    fle.seek(0)
+    digest = hashlib.file_digest(fle, "sha1").hexdigest()
+    device_asset_id = f"{os.path.basename(name).replace(' ', '')}-{filesize}"
+    return device_asset_id, digest
+
+
+def format_timezone(dt: datetime) -> str:
+    tzstring = dt.strftime("%z")
+    return f"{tzstring[:-2]}:{tzstring[-2:]}"
+
+
+def parse_timezone(offset: str) -> pytz.FixedOffset:
+    sign, hours, minutes = re.match(r"([+\-]?)(\d{2}):(\d{2})", offset).groups()
+    sign = -1 if sign == "-" else 1
+    hours, minutes = int(hours), int(minutes)
+    return pytz.FixedOffset(sign * (hours * 60) + minutes)
+
+
+def calculate_timezone(exif_time: datetime, metadata_time: datetime) -> datetime:
+    """Calculate the timezone by differing the local time to UTC"""
+    guess_tz = pytz.FixedOffset(
+        math.floor(exif_time.utcoffset().total_seconds() / 60)
+        - math.floor((metadata_time - exif_time).total_seconds() / 60)
+    )
+    return guess_tz.localize(exif_time.replace(tzinfo=None))
+
+
+def check_timestamp_exif(
+    exif_time: datetime, metadata_time: datetime
+) -> tuple[bool, datetime]:
+    has_tz = bool(exif_time.tzinfo)
+    if exif_time != metadata_time:
+        if not exif_time:
+            # No timestamp in EXIF, add it (using UTC, cant calculate timezone)
+            return True, metadata_time
+        if not has_tz and abs(
+            pytz.utc.localize(exif_time) - metadata_time
+        ) <= timedelta(hours=12):
+            # Timezone difference, calculate!
+            return True, calculate_timezone(pytz.utc.localize(exif_time), metadata_time)
+        elif has_tz:
+            # Photo moved, but has TZ, so move it but keep TZ the same
+            return True, metadata_time.astimezone(exif_time.tzinfo)
+        else:
+            # Bigger gap, just grab UTC, cant work out the right local time...
+            return True, metadata_time
+    else:
+        # All good!
+        return False, exif_time
+
+
+def update_exif_data(exif_data, new_timestamp):
+    exif_data["Exif"][ExifIFD.DateTimeOriginal] = new_timestamp.strftime(
+        DATETIME_STR_FORMAT
+    ).encode("ascii")
+    exif_data["Exif"][ExifIFD.OffsetTimeOriginal] = format_timezone(
+        new_timestamp
+    ).encode("ascii")
+
+
+def extract_exif_date(exif_data) -> datetime:
+    has_tz = ExifIFD.OffsetTimeOriginal in exif_data["Exif"]
+    exif_time = datetime.strptime(
+        exif_data["Exif"][ExifIFD.DateTimeOriginal].decode("ascii"), DATETIME_STR_FORMAT
+    )
+    if has_tz:
+        tz = parse_timezone(
+            exif_data["Exif"][ExifIFD.OffsetTimeOriginal].decode("ascii")
+        )
+        exif_time = tz.localize(exif_time)
+    return exif_time
+
+
+def deduplicate(
+    files: Iterator[tuple[str, BinaryIO, int]],
+    session: requests.Session,
+    api_key: str,
+    api_url: str,
+    progress: Progress,
+) -> Iterator[tuple[str, str, BinaryIO]]:
+    for chunk in chunk_iterator(files, size=30):
+        start = datetime.now()
+        info = [get_file_info(n, fle, size) for n, fle, size in chunk]
+        progress.log(info)
+        end = datetime.now()
+        response = session.request(
+            "POST",
+            url=f"{api_url}/api/asset/bulk-upload-check",
             headers={
-                'Accept': 'application/json',
-                'x-api-key': '',
+                "Accept": "application/json",
+                "x-api-key": api_key,
             },
-            files={
-                'assetData': FixName(fle, name)
+            json={
+                "assets": [
+                    {"id": device_asset_id, "checksum": digest}
+                    for device_asset_id, digest in info
+                ]
             },
-            data={
-                'deviceAssetId': os.path.basename(name).replace(' ', ''),  # `${path.basename(filePath)}-${fileStat.size}`.replace(/\s+/g, '')
-                'deviceId': 'gphotos-takeout-import',
-                'assetType': mimetypes.guess_type(name, strict=False)[0].split('/')[0].upper(),
-                'fileCreatedAt': datetime(year=2020, month=1, day=1).isoformat(),
-                'fileModifiedAt': datetime(year=2020, month=1, day=1).isoformat(),
-                'isFavorite': 'false',
-                'fileExtension': os.path.splitext(name)[1].lstrip('.'),
-            }
+            timeout=60,
         )
         if not response.ok:
             progress.log(f"[red]HTTP {response.status_code} {response.reason}")
             progress.log(response.text)
             response.raise_for_status()
         else:
-            progress.log(f" - {response.text}")
+            data = response.json()
+            num_duplicate = sum(
+                1
+                for x in data["results"]
+                if x["action"] == "reject" and x["reason"] == "duplicate"
+            )
+            progress.log(
+                f"Deduplicated. Hashing: {end - start} API: {response.elapsed}s  num: {num_duplicate}/{len(chunk)}"
+            )
+            for (
+                (name, fle, filesize),
+                (device_asset_id, _),
+                result,
+            ) in itertools.zip_longest(chunk, info, data["results"]):
+                if result["action"] == "reject" and result["reason"] == "duplicate":
+                    fle.close()
+                    continue
+                yield name, device_asset_id, fle
+
+
+def upload_files(
+    files: Iterator[tuple[str, BinaryIO, int]],
+    api_key: str,
+    api_url: str,
+    dry_run: bool,
+    progress: Progress,
+):
+    session = requests.session()
+    session.mount(
+        "https://",
+        HTTPAdapter(
+            max_retries=Retry(
+                total=5, backoff_factor=5, status_forcelist=[500, 502, 503, 504]
+            ),
+        ),
+    )
+    for name, device_asset_id, fle in deduplicate(
+        files, session=session, progress=progress, api_key=api_key, api_url=api_url
+    ):
+        fle.seek(0)
+        if not dry_run:
+            response = session.request(
+                "POST",
+                url=f"{api_url}/api/asset/upload",
+                headers={
+                    "Accept": "application/json",
+                    "x-api-key": api_key,
+                },
+                files={"assetData": FixName(fle, name)},
+                data={
+                    "deviceAssetId": device_asset_id,
+                    "deviceId": "gphotos-takeout-import",
+                    "assetType": mimetypes.guess_type(name, strict=False)[0]
+                    .split("/")[0]
+                    .upper(),
+                    "fileCreatedAt": datetime(year=2020, month=1, day=1).isoformat(),
+                    "fileModifiedAt": datetime(year=2020, month=1, day=1).isoformat(),
+                    "isFavorite": "false",
+                    "fileExtension": os.path.splitext(name)[1].lstrip("."),
+                },
+                timeout=60,
+            )
+            if not response.ok:
+                progress.log("Uploading...", name)
+                progress.log(f"[red]HTTP {response.status_code} {response.reason}")
+                progress.log(response.text)
+                response.raise_for_status()
+            else:
+                data = response.json()
+                if data["duplicate"]:
+                    progress.log(f"Duplicate uploaded {name}")
+                else:
+                    progress.log(
+                        f"Uploaded in {response.elapsed} {name} id: {data['id']}"
+                    )
+        fle.close()
 
 
 class FixName(object):
@@ -188,26 +384,9 @@ def iterate_tarfile(tarfle: tarfile.TarFile):
         item = tarfle.next()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     cli()
 
 
-
-# [00:41:32] Processing takeout-20230105T132237Z-001.tgz                                                                                                                              main.py:57
-# [01:36:03]  - Found 3728 metadata files and 3846 files                                                                                                                              main.py:69
-#            Processing takeout-20230105T132237Z-002.tgz                                                                                                                              main.py:57
-# [01:40:34]  - Found 251 metadata files and 280 files                                                                                                                                main.py:69
-#            Processing takeout-20230105T132237Z-003.tgz                                                                                                                              main.py:57
-# [02:00:08]  - Found 1185 metadata files and 1193 files                                                                                                                              main.py:69
-#            Processing takeout-20230105T132237Z-004.tgz                                                                                                                              main.py:57
-# [03:47:23]  - Found 12943 metadata files and 10230 files                                                                                                                            main.py:69
-#            Processing takeout-20230105T132237Z-005.tgz                                                                                                                              main.py:57
-# [05:36:56]  - Found 2867 metadata files and 5189 files                                                                                                                              main.py:69
-#            Processing takeout-20230105T132237Z-006.tgz                                                                                                                              main.py:57
-# Tar files         ━━━━━━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━  5/13   6:29:06
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7574/?  6:29:06
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 531/?   5:34:35
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2378/?  5:30:05
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 23173/? 5:10:30
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8056/?  3:23:15
-# Decoding metadata ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 9902/?  1:33:42
+# docker build --network host . -t immich-takeout:latest
+# docker run --rm -t --volume /mnt/Storage/Backups/backups/Takeout\ Backup/mic-2023-01-09:/data --network host immich-takeout:latest /data/takeout-20230105T132237Z-001.tgz
