@@ -158,6 +158,9 @@ def process_files(
             update_exif_data(exif_data, new_timestamp)
             # Write out new file
             tmp_fle = tempfile.NamedTemporaryFile("wb", suffix=".jpg")
+            if 'thumbnail' in exif_data and exif_data['thumbnail'] and len(exif_data['thumbnail']) > 64000:
+                progress.log(f"WARN: Large thumbnail, erasing {filename} {len(exif_data['thumbnail'])}")
+                del exif_data['thumbnail']
             insert(dump(exif_data), orig_binary, tmp_fle.name)
             tmp_fle.seek(0, os.SEEK_END)
             filesize = tmp_fle.tell()
@@ -213,13 +216,13 @@ def calculate_timezone(exif_time: datetime, metadata_time: datetime) -> datetime
 
 
 def check_timestamp_exif(
-    exif_time: datetime, metadata_time: datetime
+    exif_time: datetime | None, metadata_time: datetime
 ) -> tuple[bool, datetime]:
-    has_tz = bool(exif_time.tzinfo)
     if exif_time != metadata_time:
         if not exif_time:
             # No timestamp in EXIF, add it (using UTC, cant calculate timezone)
             return True, metadata_time
+        has_tz = bool(exif_time.tzinfo)
         if not has_tz and abs(
             pytz.utc.localize(exif_time) - metadata_time
         ) <= timedelta(hours=12):
@@ -245,12 +248,13 @@ def update_exif_data(exif_data, new_timestamp):
     ).encode("ascii")
 
 
-def extract_exif_date(exif_data) -> datetime:
-    has_tz = ExifIFD.OffsetTimeOriginal in exif_data["Exif"]
+def extract_exif_date(exif_data) -> datetime | None:
+    if ExifIFD.DateTimeOriginal not in exif_data["Exif"]:
+        return None
     exif_time = datetime.strptime(
         exif_data["Exif"][ExifIFD.DateTimeOriginal].decode("ascii"), DATETIME_STR_FORMAT
     )
-    if has_tz:
+    if ExifIFD.OffsetTimeOriginal in exif_data["Exif"]:
         tz = parse_timezone(
             exif_data["Exif"][ExifIFD.OffsetTimeOriginal].decode("ascii")
         )
