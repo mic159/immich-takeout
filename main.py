@@ -1,4 +1,5 @@
 import itertools
+import shutil
 from collections.abc import Iterator
 import argparse
 import tarfile
@@ -8,7 +9,7 @@ import re
 import io
 import math
 import json
-from typing import BinaryIO, TypeVar
+from typing import IO, TypeVar
 import requests
 from requests.adapters import HTTPAdapter, Retry
 import mimetypes
@@ -75,9 +76,9 @@ def cli():
 
 def extract_metadata(
     tars: list[tarfile.TarFile], progress: Progress
-) -> Iterator[tuple[str, BinaryIO, dict, int]]:
+) -> Iterator[tuple[str, IO[bytes], dict, int]]:
     metadata: dict[str, dict] = {}
-    tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
+    tar_infos: dict[str, tuple[IO[bytes], tarfile.TarInfo]] = {}
     seen = set()
     metadata_progress = progress.add_task(description="metadata", total=None)
     info_progress = progress.add_task(description="files", total=None)
@@ -87,8 +88,6 @@ def extract_metadata(
             total=os.path.getsize(tar.name),
             description=os.path.basename(tar.name),
         )
-        tar_meta_files = 0
-        tar_data_files = 0
         tar_name = os.path.basename(tar.name)
         progress.log(f"Processing [bold blue]{tar_name}")
         for tarinfo in iterate_tarfile(tar):
@@ -103,18 +102,25 @@ def extract_metadata(
                         f"[red]  - In Metadata: {filename in metadata}, In seen {filename in seen}"
                     )
                 metadata[filename] = data
-                tar_meta_files += 1
             else:
+                fle = tempfile.TemporaryFile('wb+', suffix=ext)
+                shutil.copyfileobj(
+                    fsrc=tar.extractfile(tarinfo),
+                    fdst=fle,
+                )
+                fle.seek(0)
                 filename = tarinfo.name
-                tar_infos[filename] = (tar, tarinfo)
-                tar_data_files += 1
+                tar_infos[filename] = (fle, tarinfo)
             progress.update(metadata_progress, completed=len(metadata), total=None)
             progress.update(info_progress, completed=len(tar_infos), total=None)
             if filename in tar_infos and filename in metadata:
-                archive, data_file_tarinfo = tar_infos[filename]
-                yield filename, archive.extractfile(data_file_tarinfo), metadata[
-                    filename
-                ], data_file_tarinfo.size
+                fle, data_file_tarinfo = tar_infos[filename]
+                yield (
+                    filename,
+                    fle,
+                    metadata[filename],
+                    data_file_tarinfo.size
+                )
                 del tar_infos[filename]
                 del metadata[filename]
                 seen.add(filename)
@@ -131,8 +137,8 @@ def extract_metadata(
 
 
 def process_files(
-    iter: Iterator[tuple[str, BinaryIO, dict, int]], progress: Progress
-) -> Iterator[tuple[str, BinaryIO, int]]:
+    iter: Iterator[tuple[str, IO[bytes], dict, int]], progress: Progress
+) -> Iterator[tuple[str, IO[bytes], int]]:
     skipped = 0
     for filename, fle, data, filesize in progress.track(
         iter, description="Processing files"
@@ -156,19 +162,22 @@ def process_files(
         )
         if needs_rewrite:
             update_exif_data(exif_data, new_timestamp)
-            # Write out new file
-            tmp_fle = tempfile.NamedTemporaryFile("wb", suffix=".jpg")
+            # Hack for thumbnail issues
             if 'thumbnail' in exif_data and exif_data['thumbnail'] and len(exif_data['thumbnail']) > 64000:
                 progress.log(f"WARN: Large thumbnail, erasing {filename} {len(exif_data['thumbnail'])}")
                 del exif_data['thumbnail']
+            # Write out altered images
+            # Piexif must write to files by path, so it needs to be a named file
+            tmp_fle = tempfile.NamedTemporaryFile("wb+", suffix=".jpg", delete=True)
             insert(dump(exif_data), orig_binary, tmp_fle.name)
-            tmp_fle.seek(0, os.SEEK_END)
-            filesize = tmp_fle.tell()
-            tmp_fle.seek(0)
-            progress.log(f"EXIF updated {filename} - {filesize}")
+            # Update filesize
+            filesize = os.path.getsize(tmp_fle.name)
+            progress.log(f"EXIF updated {filename}")
+            fle.close()
             yield filename, tmp_fle, filesize
         else:
             # Good, emit directly
+            progress.log(f"Emit directly {filename}")
             yield filename, fle, filesize
     progress.log(f"Skipped {skipped}")
 
@@ -187,7 +196,7 @@ def chunk_iterator(iterator: Iterator[T], size) -> Iterator[list[T]]:
         yield items
 
 
-def get_file_info(name: str, fle: BinaryIO, filesize: int) -> tuple[str, str]:
+def get_file_info(name: str, fle: IO[bytes], filesize: int) -> tuple[str, str]:
     fle.seek(0)
     digest = hashlib.file_digest(fle, "sha1").hexdigest()
     device_asset_id = f"{os.path.basename(name).replace(' ', '')}-{filesize}"
@@ -263,16 +272,15 @@ def extract_exif_date(exif_data) -> datetime | None:
 
 
 def deduplicate(
-    files: Iterator[tuple[str, BinaryIO, int]],
+    files: Iterator[tuple[str, IO[bytes], int]],
     session: requests.Session,
     api_key: str,
     api_url: str,
     progress: Progress,
-) -> Iterator[tuple[str, str, BinaryIO]]:
+) -> Iterator[tuple[str, str, IO[bytes]]]:
     for chunk in chunk_iterator(files, size=30):
         start = datetime.now()
         info = [get_file_info(n, fle, size) for n, fle, size in chunk]
-        progress.log(info)
         end = datetime.now()
         response = session.request(
             "POST",
@@ -315,7 +323,7 @@ def deduplicate(
 
 
 def upload_files(
-    files: Iterator[tuple[str, BinaryIO, int]],
+    files: Iterator[tuple[str, IO[bytes], int]],
     api_key: str,
     api_url: str,
     dry_run: bool,
