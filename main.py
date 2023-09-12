@@ -1,12 +1,10 @@
 import itertools
-import shutil
 from collections.abc import Iterator
 import argparse
 import tarfile
 import os.path
 import os
 import re
-import io
 import math
 import json
 from typing import IO, TypeVar
@@ -78,7 +76,7 @@ def extract_metadata(
     tars: list[tarfile.TarFile], progress: Progress
 ) -> Iterator[tuple[str, IO[bytes], dict, int]]:
     metadata: dict[str, dict] = {}
-    tar_infos: dict[str, tuple[IO[bytes], tarfile.TarInfo]] = {}
+    tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
     seen = set()
     metadata_progress = progress.add_task(description="metadata", total=None)
     info_progress = progress.add_task(description="files", total=None)
@@ -103,21 +101,15 @@ def extract_metadata(
                     )
                 metadata[filename] = data
             else:
-                fle = tempfile.TemporaryFile('wb+', suffix=ext)
-                shutil.copyfileobj(
-                    fsrc=tar.extractfile(tarinfo),
-                    fdst=fle,
-                )
-                fle.seek(0)
                 filename = tarinfo.name
-                tar_infos[filename] = (fle, tarinfo)
+                tar_infos[filename] = (tar, tarinfo)
             progress.update(metadata_progress, completed=len(metadata), total=None)
             progress.update(info_progress, completed=len(tar_infos), total=None)
             if filename in tar_infos and filename in metadata:
-                fle, data_file_tarinfo = tar_infos[filename]
+                tarfle, data_file_tarinfo = tar_infos[filename]
                 yield (
                     filename,
-                    fle,
+                    tarfle.extractfile(data_file_tarinfo),
                     metadata[filename],
                     data_file_tarinfo.size
                 )
@@ -146,6 +138,7 @@ def process_files(
         # Filter to only your images
         if "fromPartnerSharing" in data.get("googlePhotosOrigin", {}):
             skipped += 1
+            fle.close()
             continue
         if os.path.splitext(filename)[1].lower() not in (".jpeg", ".jpg"):
             yield filename, fle, filesize
@@ -172,12 +165,10 @@ def process_files(
             insert(dump(exif_data), orig_binary, tmp_fle.name)
             # Update filesize
             filesize = os.path.getsize(tmp_fle.name)
-            progress.log(f"EXIF updated {filename}")
             fle.close()
             yield filename, tmp_fle, filesize
         else:
             # Good, emit directly
-            progress.log(f"Emit directly {filename}")
             yield filename, fle, filesize
     progress.log(f"Skipped {skipped}")
 
@@ -334,7 +325,7 @@ def upload_files(
         "https://",
         HTTPAdapter(
             max_retries=Retry(
-                total=5, backoff_factor=5, status_forcelist=[500, 502, 503, 504]
+                total=5, backoff_factor=5, status_forcelist=[500, 502, 503, 504, 408, 429]
             ),
         ),
     )
@@ -398,7 +389,3 @@ def iterate_tarfile(tarfle: tarfile.TarFile):
 
 if __name__ == "__main__":
     cli()
-
-
-# docker build --network host . -t immich-takeout:latest
-# docker run --rm -t --volume /mnt/Storage/Backups/backups/Takeout\ Backup/mic-2023-01-09:/data --network host immich-takeout:latest /data/takeout-20230105T132237Z-001.tgz
