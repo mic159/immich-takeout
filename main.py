@@ -13,10 +13,12 @@ from requests.adapters import HTTPAdapter, Retry
 import mimetypes
 import tempfile
 import hashlib
-from piexif import load, ExifIFD, insert, dump
+import resource
+from piexif import load, GPSIFD, ExifIFD, insert, dump
 
 from datetime import datetime, timezone, timedelta
 import pytz
+from tzwhere import tzwhere
 
 from rich.progress import (
     BarColumn,
@@ -29,6 +31,7 @@ from rich.progress import (
 )
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
+TZ_GUESSER = tzwhere.tzwhere()
 
 
 def cli():
@@ -61,25 +64,41 @@ def cli():
     )
 
     with progress:
-        upload_files(
-            process_files(
-                extract_metadata(tars=tars, progress=progress), progress=progress
-            ),
-            api_key=args.api_key,
-            api_url=args.api_url,
-            dry_run=args.dry_run,
-            progress=progress,
-        )
+        skip = set()
+        if os.path.exists("uploaded.json"):
+            with open("uploaded.json", "r") as ifle:
+                skip = set(json.load(ifle))
+                progress.log(f"Loaded {len(skip)} skipped files")
+        try:
+            upload_files(
+                process_files(
+                    extract_metadata(
+                        tars=tars,
+                        skip=skip,
+                        progress=progress,
+                    ),
+                    progress=progress,
+                ),
+                api_key=args.api_key,
+                api_url=args.api_url,
+                dry_run=args.dry_run,
+                progress=progress,
+                skip=skip,
+            )
+        finally:
+            with open("uploaded.json", "w") as ofle:
+                json.dump(list(skip), ofle)
+                progress.log(f"Wrote skip file - {len(skip)}")
 
 
 def extract_metadata(
-    tars: list[tarfile.TarFile], progress: Progress
+    tars: list[tarfile.TarFile], skip: set[str], progress: Progress
 ) -> Iterator[tuple[str, IO[bytes], dict, int]]:
     metadata: dict[str, dict] = {}
     tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
-    seen = set()
-    metadata_progress = progress.add_task(description="metadata", total=None)
-    info_progress = progress.add_task(description="files", total=None)
+    seen = skip or set()
+    unmatched_max = 1
+    unmatched_taskid = progress.add_task(description="Unmatched Files", total=None)
     for tar in progress.track(tars):
         tar.fileobj = progress.wrap_file(
             tar.fileobj,
@@ -91,27 +110,28 @@ def extract_metadata(
         for tarinfo in iterate_tarfile(tar):
             filename, ext = os.path.splitext(tarinfo.name)
             if ext == ".json":
+                if filename in seen:
+                    continue
                 data = json.load(tar.extractfile(tarinfo))
-                if filename in metadata or filename in seen:
-                    progress.log(f"[red bold]❌ ERROR: Duplicate metadata found!!!")
-                    progress.log(f"[red]  - filename: {filename}")
-                    progress.log(f"[red]  - Tar: {tar.name}")
-                    progress.log(
-                        f"[red]  - In Metadata: {filename in metadata}, In seen {filename in seen}"
-                    )
                 metadata[filename] = data
             else:
                 filename = tarinfo.name
+                if filename in seen:
+                    continue
                 tar_infos[filename] = (tar, tarinfo)
-            progress.update(metadata_progress, completed=len(metadata), total=None)
-            progress.update(info_progress, completed=len(tar_infos), total=None)
+                unmatched_max = max(len(tar_infos), unmatched_max)
+                progress.update(
+                    unmatched_taskid, completed=len(tar_infos), total=unmatched_max
+                )
             if filename in tar_infos and filename in metadata:
+                if filename in seen:
+                    continue
                 tarfle, data_file_tarinfo = tar_infos[filename]
                 yield (
                     filename,
                     tarfle.extractfile(data_file_tarinfo),
                     metadata[filename],
-                    data_file_tarinfo.size
+                    data_file_tarinfo.size,
                 )
                 del tar_infos[filename]
                 del metadata[filename]
@@ -145,24 +165,45 @@ def process_files(
             continue
 
         orig_binary = fle.read()
-        exif_data = load(orig_binary)
+        try:
+            exif_data = load(orig_binary)
+        except (ValueError, TypeError) as e:
+            progress.log(f"Error, uploading directly {filename} - {e}")
+            yield filename, fle, filesize
+            continue
 
         needs_rewrite, new_timestamp = check_timestamp_exif(
             exif_time=extract_exif_date(exif_data),
+            exif_gps=extract_exif_gps(exif_data),
             metadata_time=datetime.fromtimestamp(
                 int(data["photoTakenTime"]["timestamp"]), timezone.utc
             ),
         )
+        progress.log(
+            f"{new_timestamp.isoformat()} {'[bright_magenta]UPDT[/]' if needs_rewrite else '[bright_black]ORIG[/]'} - {os.path.basename(filename)}"
+        )
         if needs_rewrite:
             update_exif_data(exif_data, new_timestamp)
             # Hack for thumbnail issues
-            if 'thumbnail' in exif_data and exif_data['thumbnail'] and len(exif_data['thumbnail']) > 64000:
-                progress.log(f"WARN: Large thumbnail, erasing {filename} {len(exif_data['thumbnail'])}")
-                del exif_data['thumbnail']
+            if (
+                "thumbnail" in exif_data
+                and exif_data["thumbnail"]
+                and len(exif_data["thumbnail"]) > 64000
+            ):
+                progress.log(
+                    f"WARN: Large thumbnail, erasing {filename} {len(exif_data['thumbnail'])}"
+                )
+                del exif_data["thumbnail"]
             # Write out altered images
             # Piexif must write to files by path, so it needs to be a named file
             tmp_fle = tempfile.NamedTemporaryFile("wb+", suffix=".jpg", delete=True)
-            insert(dump(exif_data), orig_binary, tmp_fle.name)
+            try:
+                insert(dump(exif_data), orig_binary, tmp_fle.name)
+            except (TypeError, ValueError) as e:
+                progress.log(f"Error, uploading directly {filename} - {e}")
+                tmp_fle.close()
+                yield filename, fle, filesize
+                continue
             # Update filesize
             filesize = os.path.getsize(tmp_fle.name)
             fle.close()
@@ -216,11 +257,18 @@ def calculate_timezone(exif_time: datetime, metadata_time: datetime) -> datetime
 
 
 def check_timestamp_exif(
-    exif_time: datetime | None, metadata_time: datetime
+    exif_time: datetime | None,
+    exif_gps: tuple[float, float] | None,
+    metadata_time: datetime,
 ) -> tuple[bool, datetime]:
     if exif_time != metadata_time:
         if not exif_time:
-            # No timestamp in EXIF, add it (using UTC, cant calculate timezone)
+            # No timestamp in EXIF, add it
+            if exif_gps:
+                new_tz = find_tz(exif_gps)
+                if new_tz:
+                    return True, metadata_time.astimezone(new_tz)
+            # (using UTC, cant calculate timezone)
             return True, metadata_time
         has_tz = bool(exif_time.tzinfo)
         if not has_tz and abs(
@@ -233,6 +281,10 @@ def check_timestamp_exif(
             return True, metadata_time.astimezone(exif_time.tzinfo)
         else:
             # Bigger gap, just grab UTC, cant work out the right local time...
+            if exif_gps:
+                new_tz = find_tz(exif_gps)
+                if new_tz:
+                    return True, metadata_time.astimezone(new_tz)
             return True, metadata_time
     else:
         # All good!
@@ -262,11 +314,47 @@ def extract_exif_date(exif_data) -> datetime | None:
     return exif_time
 
 
+def extract_exif_gps(exif_data) -> tuple[float, float] | None:
+    if "GPS" not in exif_data:
+        return None
+    if GPSIFD.GPSLatitude not in exif_data["GPS"]:
+        return None
+    return dms_to_dd(exif_data["GPS"])
+
+
+def dms_to_dd(gps_exif) -> tuple[float, float]:
+    # convert the rational tuples by dividing each (numerator, denominator) pair
+    lat = [n / d for n, d in gps_exif[GPSIFD.GPSLatitude]]
+    lon = [n / d for n, d in gps_exif[GPSIFD.GPSLongitude]]
+
+    # now you have lat and lon, which are lists of [degrees, minutes, seconds]
+    # from the formula above
+    dd_lat = lat[0] + lat[1] / 60 + lat[2] / 3600
+    dd_lon = lon[0] + lon[1] / 60 + lon[2] / 3600
+
+    # if latitude ref is 'S', make latitude negative
+    if gps_exif[GPSIFD.GPSLatitudeRef].decode("ascii") == "S":
+        dd_lat = -dd_lat
+
+    # if longitude ref is 'W', make longitude negative
+    if gps_exif[GPSIFD.GPSLongitudeRef].decode("ascii") == "W":
+        dd_lon = -dd_lon
+
+    return dd_lat, dd_lon
+
+
+def find_tz(exif_gps):
+    new_tz_name = TZ_GUESSER.tzNameAt(exif_gps[0], exif_gps[1])
+    if new_tz_name:
+        return pytz.timezone(new_tz_name)
+
+
 def deduplicate(
     files: Iterator[tuple[str, IO[bytes], int]],
     session: requests.Session,
     api_key: str,
     api_url: str,
+    uploaded: set[str],
     progress: Progress,
 ) -> Iterator[tuple[str, str, IO[bytes]]]:
     for chunk in chunk_iterator(files, size=30):
@@ -309,6 +397,7 @@ def deduplicate(
             ) in itertools.zip_longest(chunk, info, data["results"]):
                 if result["action"] == "reject" and result["reason"] == "duplicate":
                     fle.close()
+                    uploaded.add(name)
                     continue
                 yield name, device_asset_id, fle
 
@@ -318,6 +407,7 @@ def upload_files(
     api_key: str,
     api_url: str,
     dry_run: bool,
+    skip: set[str] | None,
     progress: Progress,
 ):
     session = requests.session()
@@ -325,12 +415,22 @@ def upload_files(
         "https://",
         HTTPAdapter(
             max_retries=Retry(
-                total=5, backoff_factor=5, status_forcelist=[500, 502, 503, 504, 408, 429]
+                total=20,
+                backoff_factor=10,
+                allowed_methods=("GET", "HEAD", "POST"),
+                status_forcelist=[500, 502, 503, 504, 408, 429],
             ),
         ),
     )
+
+    uploaded = skip or set()
     for name, device_asset_id, fle in deduplicate(
-        files, session=session, progress=progress, api_key=api_key, api_url=api_url
+        files,
+        session=session,
+        api_key=api_key,
+        api_url=api_url,
+        uploaded=uploaded,
+        progress=progress,
     ):
         fle.seek(0)
         if not dry_run:
@@ -362,6 +462,7 @@ def upload_files(
                 response.raise_for_status()
             else:
                 data = response.json()
+                uploaded.add(name)
                 if data["duplicate"]:
                     progress.log(f"Duplicate uploaded {name}")
                 else:
@@ -387,5 +488,11 @@ def iterate_tarfile(tarfle: tarfile.TarFile):
         item = tarfle.next()
 
 
+def limit_memory(maxsize):
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    resource.setrlimit(resource.RLIMIT_AS, (maxsize, hard))
+
+
 if __name__ == "__main__":
+    limit_memory(13 * 1024 * 1024 * 1024)
     cli()
