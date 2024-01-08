@@ -96,7 +96,6 @@ def extract_metadata(
 ) -> Iterator[tuple[str, IO[bytes], dict, int]]:
     metadata: dict[str, dict] = {}
     tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
-    seen = skip or set()
     unmatched_max = 1
     unmatched_taskid = progress.add_task(description="Unmatched Files", total=None)
     for tar in progress.track(tars):
@@ -110,13 +109,13 @@ def extract_metadata(
         for tarinfo in iterate_tarfile(tar):
             filename, ext = os.path.splitext(tarinfo.name)
             if ext == ".json":
-                if filename in seen:
+                if filename in skip:
                     continue
                 data = json.load(tar.extractfile(tarinfo))
                 metadata[filename] = data
             else:
                 filename = tarinfo.name
-                if filename in seen:
+                if filename in skip:
                     continue
                 tar_infos[filename] = (tar, tarinfo)
                 unmatched_max = max(len(tar_infos), unmatched_max)
@@ -124,7 +123,7 @@ def extract_metadata(
                     unmatched_taskid, completed=len(tar_infos), total=unmatched_max
                 )
             if filename in tar_infos and filename in metadata:
-                if filename in seen:
+                if filename in skip:
                     continue
                 tarfle, data_file_tarinfo = tar_infos[filename]
                 yield (
@@ -135,13 +134,12 @@ def extract_metadata(
                 )
                 del tar_infos[filename]
                 del metadata[filename]
-                seen.add(filename)
         progress.log(
             f"Dangling metadata: {len(metadata)}, Dangling files: {len(tar_infos)}"
         )
 
     progress.log("Finished extracting files")
-    progress.log(f"Num files: {len(seen)}")
+    progress.log(f"Num files: {len(skip)}")
     if len(metadata):
         progress.log(f"[yellow]⚠ Metadata dangling: {len(metadata)}")
     if len(tar_infos):
@@ -363,7 +361,7 @@ def deduplicate(
         end = datetime.now()
         response = session.request(
             "POST",
-            url=f"{api_url}/api/asset/bulk-upload-check",
+            url=os.path.join(api_url, "api/asset/bulk-upload-check"),
             headers={
                 "Accept": "application/json",
                 "x-api-key": api_key,
@@ -407,7 +405,7 @@ def upload_files(
     api_key: str,
     api_url: str,
     dry_run: bool,
-    skip: set[str] | None,
+    skip: set[str],
     progress: Progress,
 ):
     session = requests.session()
@@ -423,20 +421,19 @@ def upload_files(
         ),
     )
 
-    uploaded = skip or set()
     for name, device_asset_id, fle in deduplicate(
         files,
         session=session,
         api_key=api_key,
         api_url=api_url,
-        uploaded=uploaded,
+        uploaded=skip,
         progress=progress,
     ):
         fle.seek(0)
         if not dry_run:
             response = session.request(
                 "POST",
-                url=f"{api_url}/api/asset/upload",
+                url=os.path.join(api_url, "api/asset/upload"),
                 headers={
                     "Accept": "application/json",
                     "x-api-key": api_key,
@@ -462,7 +459,7 @@ def upload_files(
                 response.raise_for_status()
             else:
                 data = response.json()
-                uploaded.add(name)
+                skip.add(name)
                 if data["duplicate"]:
                     progress.log(f"Duplicate uploaded {name}")
                 else:
