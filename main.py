@@ -64,11 +64,8 @@ def cli():
     )
 
     with progress:
-        skip = set()
-        if os.path.exists("uploaded.json"):
-            with open("uploaded.json", "r") as ifle:
-                skip = set(json.load(ifle))
-                progress.log(f"Loaded {len(skip)} skipped files")
+        skip = TrackProcessedFiles("uploaded.json")
+        progress.log(f"Loaded {len(skip)} skipped files")
         try:
             upload_files(
                 process_files(
@@ -86,13 +83,51 @@ def cli():
                 skip=skip,
             )
         finally:
-            with open("uploaded.json", "w") as ofle:
-                json.dump(list(skip), ofle)
-                progress.log(f"Wrote skip file - {len(skip)}")
+            skip.write_file()
+
+
+class TrackProcessedFiles(object):
+    def __init__(self, filename):
+        self.filename = filename
+        self.items = set()
+        self.read_file()
+
+    def read_file(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, "r") as fle:
+                self.items = set(json.load(fle))
+
+    def write_file(self):
+        with open("uploaded.json", "w") as fle:
+            json.dump(list(self.items), fle)
+
+    def add(self, name):
+        self.items.add(name)
+        if len(self.items) % 100 == 0:
+            self.write_file()
+
+    def __contains__(self, name):
+        return name in self.items
+
+    def __len__(self):
+        return len(self.items)
+
+
+def normalise_filename(filename: str) -> tuple[str, bool]:
+    if filename.endswith(".json"):
+        filename, _ = os.path.splitext(filename)
+        was_metadata = True
+    else:
+        was_metadata = False
+    if not filename.endswith(")"):
+        return filename, was_metadata
+    base, remainder = filename.rsplit("(", 1)
+    filename, ext = os.path.splitext(base)
+    return filename + "(" + remainder + ext, was_metadata
 
 
 def extract_metadata(
-    tars: list[tarfile.TarFile], skip: set[str], progress: Progress
+    tars: list[tarfile.TarFile], skip: TrackProcessedFiles, progress: Progress
 ) -> Iterator[tuple[str, IO[bytes], dict, int]]:
     metadata: dict[str, dict] = {}
     tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
@@ -107,16 +142,13 @@ def extract_metadata(
         tar_name = os.path.basename(tar.name)
         progress.log(f"Processing [bold blue]{tar_name}")
         for tarinfo in iterate_tarfile(tar):
-            filename, ext = os.path.splitext(tarinfo.name)
-            if ext == ".json":
-                if filename in skip:
-                    continue
+            filename, was_metadata = normalise_filename(tarinfo.name)
+            if filename in skip:
+                continue
+            if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))
                 metadata[filename] = data
             else:
-                filename = tarinfo.name
-                if filename in skip:
-                    continue
                 tar_infos[filename] = (tar, tarinfo)
                 unmatched_max = max(len(tar_infos), unmatched_max)
                 progress.update(
@@ -352,7 +384,7 @@ def deduplicate(
     session: requests.Session,
     api_key: str,
     api_url: str,
-    uploaded: set[str],
+    uploaded: TrackProcessedFiles,
     progress: Progress,
 ) -> Iterator[tuple[str, str, IO[bytes]]]:
     for chunk in chunk_iterator(files, size=30):
@@ -405,7 +437,7 @@ def upload_files(
     api_key: str,
     api_url: str,
     dry_run: bool,
-    skip: set[str],
+    skip: TrackProcessedFiles,
     progress: Progress,
 ):
     session = requests.session()

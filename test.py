@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime
 from piexif import ExifIFD
 
-from main import check_timestamp_exif, extract_exif_date
+from main import check_timestamp_exif, extract_exif_date, normalise_filename
 
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
@@ -97,6 +97,45 @@ class TestTimeLogic(unittest.TestCase):
         )
         self.assertTrue(change)
         self.assertEqual(new_time.isoformat(" "), "2018-09-24 02:19:41+11:00")
+
+
+class TestMetadataMatching(unittest.TestCase):
+    def test_normalised_numbered(self):
+        self.assertEqual(
+            normalise_filename(
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg(1).json"
+            ),
+            (
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg",
+                True,
+            ),
+        )
+        self.assertEqual(
+            normalise_filename(
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg"
+            ),
+            (
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg",
+                False,
+            ),
+        )
+
+    def test_normalised_no_change(self):
+        self.assertEqual(
+            normalise_filename(
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg.json"
+            ),
+            ("Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg", True),
+        )
+        self.assertEqual(
+            normalise_filename(
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg"
+            ),
+            (
+                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg",
+                False,
+            ),
+        )
 
 
 if __name__ == "__main__":
