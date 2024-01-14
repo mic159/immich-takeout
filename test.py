@@ -2,7 +2,12 @@ import unittest
 from datetime import datetime
 from piexif import ExifIFD
 
-from main import check_timestamp_exif, extract_exif_date, normalise_filename
+from main import (
+    check_timestamp_exif,
+    extract_exif_date,
+    normalise_filename,
+    fix_truncated_name,
+)
 
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
@@ -40,6 +45,7 @@ class TestTimeLogic(unittest.TestCase):
 
         change, new_time = check_timestamp_exif(
             exif_time=extract_exif_date(exif_datetime),
+            exif_gps=None,
             metadata_time=metadata_datetime,
         )
         self.assertFalse(change)
@@ -53,6 +59,7 @@ class TestTimeLogic(unittest.TestCase):
 
         change, new_time = check_timestamp_exif(
             exif_time=extract_exif_date(exif_datetime),
+            exif_gps=None,
             metadata_time=metadata_datetime,
         )
         self.assertTrue(change)
@@ -66,6 +73,7 @@ class TestTimeLogic(unittest.TestCase):
 
         change, new_time = check_timestamp_exif(
             exif_time=extract_exif_date(exif_datetime),
+            exif_gps=None,
             metadata_time=metadata_datetime,
         )
         self.assertTrue(change)
@@ -79,6 +87,7 @@ class TestTimeLogic(unittest.TestCase):
 
         change, new_time = check_timestamp_exif(
             exif_time=extract_exif_date(exif_datetime),
+            exif_gps=None,
             metadata_time=metadata_datetime,
         )
         self.assertTrue(change)
@@ -93,6 +102,7 @@ class TestTimeLogic(unittest.TestCase):
 
         change, new_time = check_timestamp_exif(
             exif_time=extract_exif_date(exif_datetime),
+            exif_gps=None,
             metadata_time=metadata_datetime,
         )
         self.assertTrue(change)
@@ -101,23 +111,19 @@ class TestTimeLogic(unittest.TestCase):
 
 class TestMetadataMatching(unittest.TestCase):
     def test_normalised_numbered(self):
-        self.assertEqual(
-            normalise_filename(
-                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg(1).json"
-            ),
-            (
-                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg",
-                True,
-            ),
+        meta_filename = (
+            "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg(1).json"
+        )
+        image_filename = (
+            "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg"
         )
         self.assertEqual(
-            normalise_filename(
-                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg"
-            ),
-            (
-                "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910(1).jpg",
-                False,
-            ),
+            normalise_filename(meta_filename),
+            (image_filename, True),
+        )
+        self.assertEqual(
+            normalise_filename(image_filename),
+            (image_filename, False),
         )
 
     def test_normalised_no_change(self):
@@ -135,6 +141,36 @@ class TestMetadataMatching(unittest.TestCase):
                 "Takeout/Google Photos/Photos from 2022/PXL_20221220_060913910.jpg",
                 False,
             ),
+        )
+
+    def test_normalised_max_size(self):
+        meta_filename = "Takeout/Google Photos/Photos from 2023/story_image_v2_336d088f-fbe5-43a1-b765-58c29b9.json"
+        image_filename = "Takeout/Google Photos/Photos from 2023/story_image_v2_336d088f-fbe5-43a1-b765-58c29b9a.jpg"
+        meta_data = {
+            "title": "story_image_v2_336d088f-fbe5-43a1-b765-58c29b9a5b2f_640_wide.jpg",
+        }
+        self.assertEqual(
+            fix_truncated_name(normalise_filename(meta_filename)[0], meta_data),
+            image_filename,
+        )
+        self.assertEqual(
+            normalise_filename(image_filename),
+            (image_filename, False),
+        )
+
+    def test_normalised_max_size_with_number(self):
+        meta_filename = "Takeout/Google Photos/Photos from 2023/story_video_10719a13-534f-4c77-9fe7-0a92a3186d(1).json"
+        image_filename = "Takeout/Google Photos/Photos from 2023/story_video_10719a13-534f-4c77-9fe7-0a92a3186da(1).mp4"
+        meta_data = {
+            "title": "story_video_10719a13-534f-4c77-9fe7-0a92a3186da5_720_high.mp4",
+        }
+        self.assertEqual(
+            fix_truncated_name(normalise_filename(meta_filename)[0], meta_data),
+            image_filename,
+        )
+        self.assertEqual(
+            normalise_filename(image_filename),
+            (image_filename, False),
         )
 
 

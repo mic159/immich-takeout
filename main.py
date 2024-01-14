@@ -32,6 +32,7 @@ from rich.progress import (
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
 TZ_GUESSER = tzwhere.tzwhere()
+MAX_NAME_LENGTH = 90  # Google Photos truncates filenames in the tars at this size.
 
 
 def cli():
@@ -64,7 +65,7 @@ def cli():
     )
 
     with progress:
-        skip = TrackProcessedFiles("uploaded.json")
+        skip = TrackProcessedFiles("uploaded.json", progress)
         progress.log(f"Loaded {len(skip)} skipped files")
         try:
             upload_files(
@@ -87,8 +88,9 @@ def cli():
 
 
 class TrackProcessedFiles(object):
-    def __init__(self, filename):
+    def __init__(self, filename, progress):
         self.filename = filename
+        self.progress = progress
         self.items = set()
         self.read_file()
 
@@ -99,10 +101,14 @@ class TrackProcessedFiles(object):
 
     def write_file(self):
         with open("uploaded.json", "w") as fle:
+            self.progress.log(
+                f"Flushing uploaded.json {len(self.items)} {len(list(self.items))}"
+            )
             json.dump(list(self.items), fle)
 
     def add(self, name):
         self.items.add(name)
+        self.progress.log(f"Recording {name} {len(self.items)}")
         if len(self.items) % 100 == 0:
             self.write_file()
 
@@ -126,6 +132,23 @@ def normalise_filename(filename: str) -> tuple[str, bool]:
     return filename + "(" + remainder + ext, was_metadata
 
 
+def fix_truncated_name(filename, metadata):
+    """
+    Google Photos truncates filenames in the tar after 90 characters.
+    That means if the file extension is shorter than ".json", we need to recover data from
+    within the metadata file and get the cut off characters.
+    """
+    original_filename = metadata["title"]
+    if os.path.basename(filename) != original_filename and len(
+        filename
+    ) >= MAX_NAME_LENGTH - len(".json"):
+        fname, ext = os.path.splitext(original_filename)
+        dir = os.path.dirname(filename)
+        new_filename = fname[: MAX_NAME_LENGTH - len(dir) - len(ext) - 1] + ext
+        return os.path.join(dir, new_filename)
+    return filename
+
+
 def extract_metadata(
     tars: list[tarfile.TarFile], skip: TrackProcessedFiles, progress: Progress
 ) -> Iterator[tuple[str, IO[bytes], dict, int]]:
@@ -147,6 +170,7 @@ def extract_metadata(
                 continue
             if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))
+                filename = fix_truncated_name(filename, data)
                 metadata[filename] = data
             else:
                 tar_infos[filename] = (tar, tarinfo)
