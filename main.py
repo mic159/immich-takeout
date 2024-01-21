@@ -119,6 +119,13 @@ class TrackProcessedFiles(object):
         return len(self.items)
 
 
+def extract_number_from_filename(filename: str) -> str:
+    if not filename.endswith(")"):
+        return ""
+    _, remainder = filename.rsplit("(", 1)
+    return "(" + remainder
+
+
 def normalise_filename(filename: str) -> tuple[str, bool]:
     if filename.endswith(".json"):
         filename, _ = os.path.splitext(filename)
@@ -134,6 +141,7 @@ def normalise_filename(filename: str) -> tuple[str, bool]:
 
 def fix_truncated_name(filename, metadata):
     """
+    For use on the ".json" metadata files.
     Google Photos truncates filenames in the tar after 90 characters.
     That means if the file extension is shorter than ".json", we need to recover data from
     within the metadata file and get the cut off characters.
@@ -144,7 +152,11 @@ def fix_truncated_name(filename, metadata):
     ) >= MAX_NAME_LENGTH - len(".json"):
         fname, ext = os.path.splitext(original_filename)
         dir = os.path.dirname(filename)
-        new_filename = fname[: MAX_NAME_LENGTH - len(dir) - len(ext) - 1] + ext
+        # The number on a duplicated filename is ontop of the truncated name, and needs adding back in.
+        numbered_mark = extract_number_from_filename(filename)
+        new_filename = (
+            fname[: MAX_NAME_LENGTH - len(dir) - len(ext) - 1] + numbered_mark + ext
+        )
         return os.path.join(dir, new_filename)
     return filename
 
