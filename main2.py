@@ -1,4 +1,3 @@
-import itertools
 from collections.abc import Iterator
 import argparse
 import tarfile
@@ -6,16 +5,14 @@ import os.path
 import os
 import re
 import math
-import json
-from typing import IO, TypeVar
+from typing import TypeVar
 import requests
 from requests.adapters import HTTPAdapter, Retry
 import mimetypes
-import hashlib
 import resource
 from piexif import load, GPSIFD, ExifIFD
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 import pytz
 from tzwhere import tzwhere
 
@@ -32,7 +29,6 @@ from rich.progress import (
 from immich_takeout.processed_file_tracker import ProcessedFileTracker
 from immich_takeout.metadata_matching import extract_metadata
 from immich_takeout.local_file import LocalFile
-from immich_takeout.google_metadata import is_partner_sharing
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
 TZ_GUESSER = tzwhere.tzwhere()
@@ -150,18 +146,6 @@ def chunk_iterator(iterator: Iterator[T], size) -> Iterator[list[T]]:
         yield items
 
 
-def get_file_info(name: str, fle: IO[bytes], filesize: int) -> tuple[str, str]:
-    fle.seek(0)
-    digest = hashlib.file_digest(fle, "sha1").hexdigest()
-    device_asset_id = f"{os.path.basename(name).replace(' ', '')}-{filesize}"
-    return device_asset_id, digest
-
-
-def format_timezone(dt: datetime) -> str:
-    tzstring = dt.strftime("%z")
-    return f"{tzstring[:-2]}:{tzstring[-2:]}"
-
-
 def parse_timezone(offset: str) -> pytz.FixedOffset:
     sign, hours, minutes = re.match(r"([+\-]?)(\d{2}):(\d{2})", offset).groups()
     sign = -1 if sign == "-" else 1
@@ -213,15 +197,6 @@ def check_timestamp_exif(
         return False, exif_time
 
 
-def update_exif_data(exif_data, new_timestamp):
-    exif_data["Exif"][ExifIFD.DateTimeOriginal] = new_timestamp.strftime(
-        DATETIME_STR_FORMAT
-    ).encode("ascii")
-    exif_data["Exif"][ExifIFD.OffsetTimeOriginal] = format_timezone(
-        new_timestamp
-    ).encode("ascii")
-
-
 def extract_exif_date(exif_data) -> datetime | None:
     if ExifIFD.DateTimeOriginal not in exif_data["Exif"]:
         return None
@@ -271,56 +246,6 @@ def find_tz(exif_gps):
         return pytz.timezone(new_tz_name)
 
 
-# def deduplicate(
-#     files: Iterator[LocalFile],
-#     session: requests.Session,
-#     api_key: str,
-#     api_url: str,
-#     uploaded: ProcessedFileTracker,
-#     progress: Progress,
-# ) -> Iterator[LocalFile]:
-#     for chunk in chunk_iterator(files, size=10):
-#         start = datetime.now()
-#         end = datetime.now()
-#         response = session.request(
-#             "POST",
-#             url=os.path.join(api_url, "api/asset/bulk-upload-check"),
-#             headers={
-#                 "Accept": "application/json",
-#                 "x-api-key": api_key,
-#             },
-#             json={
-#                 "assets": [
-#                     {"id": item.device_asset_id, "checksum": item.file_sha1}
-#                     for item in chunk
-#                 ]
-#             },
-#             timeout=60,
-#         )
-#         if not response.ok:
-#             progress.log(f"[red]HTTP {response.status_code} {response.reason}")
-#             progress.log(response.text)
-#             response.raise_for_status()
-#         else:
-#             data = response.json()
-#             num_duplicate = sum(
-#                 1
-#                 for x in data["results"]
-#                 if x["action"] == "reject" and x["reason"] == "duplicate"
-#             )
-#             progress.log(
-#                 f"Deduplicated. Hashing: {end - start} API: {response.elapsed}s  num: {num_duplicate}/{len(chunk)}"
-#             )
-#             for (
-#                 item,
-#                 result,
-#             ) in itertools.zip_longest(chunk, data["results"]):
-#                 if result["action"] == "reject" and result["reason"] == "duplicate":
-#                     uploaded.add(item.filename_from_archive)
-#                     continue
-#                 yield item
-
-
 def upload_files(
     files: Iterator[LocalFile],
     api_key: str,
@@ -342,14 +267,6 @@ def upload_files(
         ),
     )
 
-    # for item in deduplicate(
-    #     files,
-    #     session=session,
-    #     api_key=api_key,
-    #     api_url=api_url,
-    #     uploaded=skip,
-    #     progress=progress,
-    # ):
     for item in files:
         if not dry_run:
             item.file_obj.seek(0)
@@ -375,7 +292,6 @@ def upload_files(
                 timeout=60,
             )
             if not response.ok:
-                progress.log("Uploading...", item.name)
                 progress.log(f"[red]HTTP {response.status_code} {response.reason}")
                 progress.log(response.text)
                 response.raise_for_status()
@@ -385,9 +301,7 @@ def upload_files(
                 if data["duplicate"]:
                     progress.log(f"[yellow]Duplicate[/yellow] {item.name}")
                 else:
-                    progress.log(
-                        f"Uploaded in {response.elapsed} {item.name} id: {data['id']}"
-                    )
+                    progress.log(f"✔ Uploaded {item.name}")
                     if item.timestamp_differs:
                         update_asset_metadata(
                             session=session,
@@ -410,7 +324,6 @@ def update_asset_metadata(
     }
     if item.gps:
         json_data["latitude"], json_data["longitude"] = item.gps
-    print(asset_id, json_data)
     resp = session.put(
         url=os.path.join(api_url, "api/asset", asset_id),
         json=json_data,
