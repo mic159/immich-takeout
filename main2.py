@@ -8,7 +8,6 @@ import math
 from typing import TypeVar
 import requests
 from requests.adapters import HTTPAdapter, Retry
-import mimetypes
 import resource
 from piexif import load, GPSIFD, ExifIFD
 
@@ -97,7 +96,7 @@ def process_files(
 
         metadata_time = item.metadata_original_timestamp
 
-        if os.path.splitext(item.name)[1].lower() not in (".jpeg", ".jpg"):
+        if item.file_extension.lower() not in (".jpeg", ".jpg"):
             if metadata_time != item.last_modified:
                 item.timestamp_differs = True
             progress.log(
@@ -281,13 +280,11 @@ def upload_files(
                 data={
                     "deviceAssetId": item.device_asset_id,
                     "deviceId": "gphotos-takeout-import",
-                    "assetType": mimetypes.guess_type(item.name, strict=False)[0]
-                    .split("/")[0]
-                    .upper(),
+                    "assetType": item.asset_type,
                     "fileCreatedAt": item.original_time.isoformat(),
                     "fileModifiedAt": item.last_modified.isoformat(),
                     "isFavorite": "false",
-                    "fileExtension": os.path.splitext(item.name)[1].lstrip("."),
+                    "fileExtension": item.file_extension,
                 },
                 timeout=60,
             )

@@ -1,5 +1,7 @@
+import os.path
 import tarfile
 import hashlib
+import mimetypes
 from datetime import datetime, timezone
 
 
@@ -57,3 +59,13 @@ class LocalFile(object):
                 longitude = self.takeout_metadata["geoDataExif"]["longitude"]
                 return lat, longitude
         return None
+
+    @property
+    def asset_type(self):
+        mime, _ = mimetypes.guess_type(self.name, strict=False)
+        mime_type, mime_subtype = mime.split("/")
+        return mime_type.upper()
+
+    @property
+    def file_extension(self):
+        return os.path.splitext(self.name)[1].lstrip(".")
