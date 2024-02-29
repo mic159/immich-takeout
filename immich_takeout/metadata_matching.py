@@ -78,6 +78,9 @@ def extract_metadata(
             filename, was_metadata = normalise_filename(tarinfo.name)
             if filename in skip:
                 continue
+            if filename.endswith(".MP") or filename.endswith("archive_browser.html"):
+                # MD files are duplicated data from inside the jpeg, no need to process them
+                continue
             if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))
                 filename = fix_truncated_name(filename, data)
