@@ -260,6 +260,35 @@ class TestMetadataMatching(unittest.TestCase):
             actual[0].filename_from_archive,
         )
 
+    def test_matching_file_numbered(self):
+        archive = create_mock_archive(
+            [
+                create_mock_metadata(
+                    filename="Takeout/Google Photos/Photos from 2020/PXL_20200930_080707712.PORTRAIT-01.COVER.jpg.json",
+                    meta_title="PXL_20200930_080707712.PORTRAIT-01.COVER.jpg",
+                ),
+                create_mock_image(
+                    filename="Takeout/Google Photos/Photos from 2020/PXL_20200930_080707712.PORTRAIT-01.COVER.jpg"
+                ),
+                create_mock_metadata(
+                    filename="Takeout/Google Photos/Photos from 2020/PXL_20200930_080707712.PORTRAIT-01.COVER.jpg(1).json",
+                    meta_title="PXL_20200930_080707712.PORTRAIT-01.COVER.jpg",
+                ),
+                create_mock_image(
+                    filename="Takeout/Google Photos/Photos from 2020/PXL_20200930_080707712.PORTRAIT-01.COVER(1).jpg"
+                ),
+            ]
+        )
+        actual = extract_metadata(
+            tars=[archive],
+            progress=MOCK_PROGRESS,
+            skip=ProcessedFileTracker("test.json"),
+            report=Report("test.csv", disable=True),
+        )
+        actual = list(actual)
+        print([f.name for f in actual])
+        self.assertEqual(len(actual), 2)
+
 
 def create_mock_metadata(
     filename: str, meta_title: str

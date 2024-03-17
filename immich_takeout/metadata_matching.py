@@ -31,9 +31,11 @@ def normalise_filename(filename: str) -> tuple[str, bool]:
 
 
 def extract_number_from_filename(filename: str) -> str:
-    if not filename.endswith(")"):
+    if not filename.endswith(")") and ")." not in filename:
         return ""
     _, remainder = filename.rsplit("(", 1)
+    if os.path.extsep in remainder:
+        remainder, _ = os.path.splitext(remainder)
     return "(" + remainder
 
 
