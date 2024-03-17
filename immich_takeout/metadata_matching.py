@@ -93,7 +93,7 @@ def cleanup_motion_videos(tar_infos: dict[str, any], seen: set[str]):
                 jpeg_name = fname + ".jpg"
             if jpeg_name in seen:
                 del tar_infos[full_fname]
-        if ext == ".MP" or ext.startswith(".MP~"):
+        if ext in (".MP", ".MP ") or ext.startswith(".MP~"):
             # Google pixel motion photos
             if fname.endswith(")") and "(" in fname:
                 # Numbered file, move the number
