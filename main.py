@@ -280,7 +280,7 @@ def upload_files(
                     "fileCreatedAt": item.original_time.isoformat(),
                     "fileModifiedAt": item.last_modified.isoformat(),
                     "isFavorite": "false",
-                    "fileExtension": item.file_extension,
+                    "fileExtension": item.file_extension.lstrip("."),
                 },
                 timeout=60,
             )

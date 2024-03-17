@@ -73,4 +73,4 @@ class LocalFile(object):
 
     @property
     def file_extension(self):
-        return os.path.splitext(self.name)[1].lstrip(".")
+        return os.path.splitext(self.name)[1]
