@@ -1,6 +1,7 @@
 import os
 import json
 import tarfile
+from csv import DictWriter
 from typing import Iterator
 from rich.progress import Progress
 
@@ -30,7 +31,7 @@ def extract_number_from_filename(filename: str) -> str:
     return "(" + remainder
 
 
-def fix_truncated_name(filename, metadata):
+def fix_truncated_name(filename, metadata) -> str:
     """
     For use on the ".json" metadata files.
     Google Photos truncates filenames in the tar after 90 characters.
@@ -59,63 +60,134 @@ def iterate_tarfile(tarfle: tarfile.TarFile):
         item = tarfle.next()
 
 
+def cleanup_motion_videos(tar_infos: dict[str, any], seen: set[str]):
+    names = set(tar_infos.keys())
+    for full_fname in names:
+        fname, ext = os.path.splitext(full_fname)
+        if ext.lower() == ".mp4":
+            # Samsung motion photos
+            jpeg_name = fname + ".jpg"
+            if jpeg_name in seen:
+                del tar_infos[full_fname]
+        if ext == ".MP" or ext.startswith(".MP~"):
+            # Google pixel motion photos
+            jpeg_name = full_fname + ".jpg"
+            if jpeg_name in seen:
+                del tar_infos[full_fname]
+        if fname.endswith("-edited"):
+            # Google photos edited, only keep the original
+            del tar_infos[full_fname]
+        if fname.endswith(")") and "(" in fname:
+            # Duplicate photos (google photos "duplicate" button)
+            orig_name = fname[0 : fname.index("(")] + ext
+            if orig_name in seen:
+                del tar_infos[full_fname]
+
+
+def match_files(
+    was_metadata: bool,
+    filename: str,
+    tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]],
+    metadata: dict[str, dict],
+) -> tuple[tuple[tarfile.TarFile, tarfile.TarInfo] | None, dict | None]:
+    if filename in tar_infos and filename in metadata:
+        return tar_infos[filename], metadata[filename]
+    if was_metadata and not os.path.splitext(filename)[1]:
+        # Had no file extension, lets see if the file had jpg
+        filename_jpg = os.path.extsep.join([filename, "jpg"])
+        if filename in metadata and filename_jpg in tar_infos:
+            return tar_infos[filename_jpg], metadata[filename]
+    if not was_metadata and os.path.splitext(filename)[1]:
+        # Let's see if we can match by dropping the file extension
+        filename_noext, _ = os.path.splitext(filename)
+        if filename_noext in metadata and filename in tar_infos:
+            return tar_infos[filename], metadata[filename_noext]
+    return None, None
+
+
 def extract_metadata(
     tars: list[tarfile.TarFile], skip: ProcessedFileTracker, progress: Progress
 ) -> Iterator[LocalFile]:
     metadata: dict[str, dict] = dict()
+    seen: set[str] = set()
     tar_infos: dict[str, tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
     unmatched_max = 1
     unmatched_taskid = progress.add_task(description="Unmatched Files", total=None)
     for tar in progress.track(tars):
-        tar.fileobj = progress.wrap_file(
-            tar.fileobj,
-            total=os.path.getsize(tar.name),
-            description=os.path.basename(tar.name),
-        )
+        if not progress.disable:
+            # Skip this for unit tests
+            tar.fileobj = progress.wrap_file(
+                tar.fileobj,
+                total=os.path.getsize(tar.name),
+                description=os.path.basename(tar.name),
+            )
         tar_name = os.path.basename(tar.name)
         progress.log(f"Processing [bold blue]{tar_name}")
         for tarinfo in iterate_tarfile(tar):
             filename, was_metadata = normalise_filename(tarinfo.name)
-            if filename in skip:
-                continue
-            if filename.endswith(".MP") or filename.endswith("archive_browser.html"):
-                # MD files are duplicated data from inside the jpeg, no need to process them
+            if filename in skip or filename.endswith("archive_browser.html"):
                 continue
             if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))
                 filename = fix_truncated_name(filename, data)
                 metadata[filename] = data
+                metadata[filename]["tar_name"] = tar_name
+                metadata[filename]["metadata_filename"] = filename
             else:
                 tar_infos[filename] = (tar, tarinfo)
                 unmatched_max = max(len(tar_infos), unmatched_max)
                 progress.update(
                     unmatched_taskid, completed=len(tar_infos), total=unmatched_max
                 )
-            if filename in tar_infos and filename in metadata:
-                tarfle, data_file_tarinfo = tar_infos[filename]
+            matched_data_file, matched_metadata = match_files(
+                was_metadata=was_metadata,
+                filename=filename,
+                tar_infos=tar_infos,
+                metadata=metadata,
+            )
+            if matched_data_file is not None and matched_metadata is not None:
+                tarfle, data_file_tarinfo = matched_data_file
                 yield LocalFile(
-                    filename,
-                    metadata[filename],
+                    data_file_tarinfo.name,
+                    matched_metadata,
                     data_file_tarinfo,
                     tarfle.extractfile(data_file_tarinfo),
                 )
-                del tar_infos[filename]
-                del metadata[filename]
+                del tar_infos[data_file_tarinfo.name]
+                del metadata[matched_metadata["metadata_filename"]]
+                seen.add(filename)
         progress.log(
             f"Dangling metadata: {len(metadata)}, Dangling files: {len(tar_infos)}"
         )
 
     progress.log("Finished extracting files")
-    progress.log(f"Num files: {len(skip)}")
+    progress.log("Cleaning up unmatched files")
+    cleanup_motion_videos(tar_infos, seen)
     if len(metadata):
         progress.log(f"[yellow]⚠ Metadata dangling: {len(metadata)}")
     if len(tar_infos):
         progress.log(f"[yellow]⚠ Files dangling: {len(tar_infos)}")
-    with open("missing.json", "w") as fle:
-        json.dump(
-            {
-                "metadata": list(metadata.keys()),
-                "files": list(tar_infos.keys()),
-            },
-            fle,
+    progress.log(f"[green]Matched {len(seen)} files")
+    with open("missing.csv", "w") as fle:
+        writer = DictWriter(fle, fieldnames=("tar", "file", "state"))
+        writer.writeheader()
+        writer.writerows(
+            {"tar": data["tar_name"], "file": name, "state": "Metadata with no file"}
+            for name, data in metadata.items()
         )
+        writer.writerows(
+            {
+                "tar": os.path.basename(the_tar.name),
+                "file": name,
+                "state": "Metadata Missing",
+            }
+            for name, (the_tar, _) in tar_infos.items()
+        )
+        writer.writerows({"tar": "?", "file": name, "state": "Done"} for name in seen)
+        # json.dump(
+        #     {
+        #         "metadata": list(metadata.keys()),
+        #         "files": list(tar_infos.keys()),
+        #     },
+        #     fle,
+        # )

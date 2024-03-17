@@ -1,17 +1,28 @@
+import io
 import unittest
+import tarfile
+import json
 from datetime import datetime
 from piexif import ExifIFD
+from rich.progress import Progress
 
 from main import (
     check_timestamp_exif,
     extract_exif_date,
+)
+from immich_takeout.metadata_matching import (
     normalise_filename,
     fix_truncated_name,
+    extract_metadata,
 )
+from immich_takeout.processed_file_tracker import ProcessedFileTracker
 
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
 ISOFORMAT = "%Y-%m-%d %H:%M:%S%z"
+
+
+MOCK_PROGRESS = Progress(auto_refresh=False, disable=True)
 
 
 class TestTimeLogic(unittest.TestCase):
@@ -172,6 +183,92 @@ class TestMetadataMatching(unittest.TestCase):
             normalise_filename(image_filename),
             (image_filename, False),
         )
+
+    def test_missing_file_extension_image_first(self):
+        archive = create_mock_archive(
+            [
+                create_mock_image(
+                    filename="Takeout/Google Photos/Photos from 2014/2014-04-30.jpg"
+                ),
+                create_mock_metadata(
+                    filename="Takeout/Google Photos/Photos from 2014/2014-04-30.json",
+                    meta_title="2014-04-30",
+                ),
+            ]
+        )
+        actual = extract_metadata(
+            tars=[archive],
+            progress=MOCK_PROGRESS,
+            skip=ProcessedFileTracker("test.json"),
+        )
+        actual = list(actual)
+        self.assertEqual(len(actual), 1)
+        self.assertEqual(
+            "Takeout/Google Photos/Photos from 2014/2014-04-30.jpg",
+            actual[0].filename_from_archive,
+        )
+
+    def test_missing_file_extension_metadata_first(self):
+        archive = create_mock_archive(
+            [
+                create_mock_metadata(
+                    filename="Takeout/Google Photos/Photos from 2014/2014-04-30.json",
+                    meta_title="2014-04-30",
+                ),
+                create_mock_image(
+                    filename="Takeout/Google Photos/Photos from 2014/2014-04-30.jpg"
+                ),
+            ]
+        )
+        actual = extract_metadata(
+            tars=[archive],
+            progress=MOCK_PROGRESS,
+            skip=ProcessedFileTracker("test.json"),
+        )
+        actual = list(actual)
+        self.assertEqual(len(actual), 1)
+        self.assertEqual(
+            "Takeout/Google Photos/Photos from 2014/2014-04-30.jpg",
+            actual[0].filename_from_archive,
+        )
+
+
+def create_mock_metadata(
+    filename: str, meta_title: str
+) -> tuple[tarfile.TarInfo, io.BytesIO]:
+    bytes_fle = io.BytesIO()
+    json_string = json.dumps(
+        obj={
+            "title": meta_title,
+        }
+    )
+    bytes_fle.write(json_string.encode())
+    tarinfo = tarfile.TarInfo(name=filename)
+    tarinfo.size = bytes_fle.tell()
+    bytes_fle.seek(0)
+    return tarinfo, bytes_fle
+
+
+def create_mock_image(filename: str) -> tuple[tarfile.TarInfo, io.BytesIO]:
+    tarinfo = tarfile.TarInfo(name=filename)
+    fd = io.BytesIO()
+    with open("Blank.jpg", "rb") as image_fle:
+        fd.write(image_fle.read())
+    tarinfo.size = fd.tell()
+    fd.seek(0)
+    image_fle.close()
+    return tarinfo, fd
+
+
+def create_mock_archive(
+    mock_files: list[tuple[tarfile.TarInfo, io.BytesIO]]
+) -> tarfile.TarFile:
+    fd = io.BytesIO()
+    tar = tarfile.open(fileobj=fd, mode="w")
+    for tarinfo, fle in mock_files:
+        tar.addfile(tarinfo=tarinfo, fileobj=fle)
+    fd.seek(0)
+    return tarfile.open(fileobj=fd, name="test.tar")
 
 
 if __name__ == "__main__":
