@@ -12,6 +12,12 @@ MAX_NAME_LENGTH = 90
 
 
 def normalise_filename(filename: str) -> tuple[str, bool]:
+    """
+    Removes the .json extension so the metadata can be matched with the original file
+
+    NOTE: Will not handle the truncating due to the 90 character max length.
+    See: fix_truncated_name()
+    """
     if filename.endswith(".json"):
         filename, _ = os.path.splitext(filename)
         was_metadata = True
@@ -29,6 +35,16 @@ def extract_number_from_filename(filename: str) -> str:
         return ""
     _, remainder = filename.rsplit("(", 1)
     return "(" + remainder
+
+
+def rebuild_numbered_filename(filename: str, number: str, new_ext: str) -> str:
+    """
+    For use to go from MP file to jpg file with numbers
+    Eg, test(2).MP -> test.MP(2).jpg
+    """
+    base, remainder = filename.rsplit("(", 1)
+    _, original_extension = remainder.split(")", 1)
+    return base + original_extension + number + new_ext
 
 
 def fix_truncated_name(filename, metadata) -> str:
@@ -66,22 +82,33 @@ def cleanup_motion_videos(tar_infos: dict[str, any], seen: set[str]):
         fname, ext = os.path.splitext(full_fname)
         if ext.lower() == ".mp4":
             # Samsung motion photos
-            jpeg_name = fname + ".jpg"
+            if fname.endswith(")") and "(" in fname:
+                # Numbered file, move the number
+                jpeg_name = rebuild_numbered_filename(
+                    fname,
+                    number=extract_number_from_filename(fname),
+                    new_ext=".jpg",
+                )
+            else:
+                jpeg_name = fname + ".jpg"
             if jpeg_name in seen:
                 del tar_infos[full_fname]
         if ext == ".MP" or ext.startswith(".MP~"):
             # Google pixel motion photos
-            jpeg_name = full_fname + ".jpg"
+            if fname.endswith(")") and "(" in fname:
+                # Numbered file, move the number
+                jpeg_name = rebuild_numbered_filename(
+                    full_fname,
+                    number=extract_number_from_filename(fname),
+                    new_ext=".jpg",
+                )
+            else:
+                jpeg_name = full_fname + ".jpg"
             if jpeg_name in seen:
                 del tar_infos[full_fname]
         if fname.endswith("-edited"):
             # Google photos edited, only keep the original
             del tar_infos[full_fname]
-        if fname.endswith(")") and "(" in fname:
-            # Duplicate photos (google photos "duplicate" button)
-            orig_name = fname[0 : fname.index("(")] + ext
-            if orig_name in seen:
-                del tar_infos[full_fname]
 
 
 def match_files(

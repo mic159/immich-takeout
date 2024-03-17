@@ -182,6 +182,19 @@ class TestMetadataMatching(unittest.TestCase):
             tar_infos,
         )
 
+    def test_cleanup_motion_pictures_google_numbered(self):
+        seen = {
+            "Takeout/Google Photos/Photos from 2020/PXL_20201115_044452482.MP(1).jpg"
+        }
+        tar_infos = {
+            "Takeout/Google Photos/Photos from 2020/PXL_20201115_044452482(1).MP": None
+        }
+        cleanup_motion_videos(tar_infos=tar_infos, seen=seen)
+        self.assertNotIn(
+            "Takeout/Google Photos/Photos from 2020/PXL_20201115_044452482(1).MP",
+            tar_infos,
+        )
+
     def test_normalised_max_size_with_number(self):
         meta_filename = "Takeout/Google Photos/Photos from 2023/story_video_10719a13-534f-4c77-9fe7-0a92a3186d(1).json"
         image_filename = "Takeout/Google Photos/Photos from 2023/story_video_10719a13-534f-4c77-9fe7-0a92a3186da(1).mp4"
