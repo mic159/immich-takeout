@@ -7,9 +7,14 @@ from datetime import datetime, timezone
 
 class LocalFile(object):
     def __init__(
-        self, filename_from_archive, takeout_metadata, tarinfo: tarfile.TarInfo, fileobj
+        self,
+        takeout_metadata: dict,
+        tarinfo: tarfile.TarInfo,
+        fileobj,
+        tarfile_name: str,
     ):
-        self.filename_from_archive = filename_from_archive
+        self.archive_filename = tarfile_name
+        self.filename_from_archive = tarinfo.name
         self.takeout_metadata = takeout_metadata
         self.file_size = tarinfo.size
         self.file_obj = fileobj

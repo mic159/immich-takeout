@@ -27,6 +27,7 @@ from rich.progress import (
 from immich_takeout.processed_file_tracker import ProcessedFileTracker
 from immich_takeout.metadata_matching import extract_metadata
 from immich_takeout.local_file import LocalFile
+from immich_takeout.report import Report
 from immich_takeout.utils import FixName
 
 DATETIME_STR_FORMAT = "%Y:%m:%d %H:%M:%S"
@@ -69,8 +70,10 @@ def cli():
     )
 
     with progress:
-        skip = ProcessedFileTracker("uploaded_main2.json")
+        skip = ProcessedFileTracker("uploaded.json")
+        skip.read_file()
         progress.log(f"Loaded {len(skip)} skipped files")
+        report = Report("report.csv")
         try:
             upload_files(
                 process_files(
@@ -78,6 +81,7 @@ def cli():
                         tars=tars,
                         skip=skip,
                         progress=progress,
+                        report=report,
                     ),
                     progress=progress,
                 ),
@@ -89,6 +93,7 @@ def cli():
             )
         finally:
             skip.write_file()
+            report.close()
 
 
 def process_files(

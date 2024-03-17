@@ -1,12 +1,12 @@
 import os
 import json
 import tarfile
-from csv import DictWriter
 from typing import Iterator
 from rich.progress import Progress
 
 from .local_file import LocalFile
 from .processed_file_tracker import ProcessedFileTracker
+from .report import Report
 
 MAX_NAME_LENGTH = 90
 
@@ -106,7 +106,10 @@ def match_files(
 
 
 def extract_metadata(
-    tars: list[tarfile.TarFile], skip: ProcessedFileTracker, progress: Progress
+    tars: list[tarfile.TarFile],
+    skip: ProcessedFileTracker,
+    progress: Progress,
+    report: Report,
 ) -> Iterator[LocalFile]:
     metadata: dict[str, dict] = dict()
     seen: set[str] = set()
@@ -147,15 +150,17 @@ def extract_metadata(
             )
             if matched_data_file is not None and matched_metadata is not None:
                 tarfle, data_file_tarinfo = matched_data_file
-                yield LocalFile(
-                    data_file_tarinfo.name,
-                    matched_metadata,
-                    data_file_tarinfo,
-                    tarfle.extractfile(data_file_tarinfo),
+                local_file = LocalFile(
+                    takeout_metadata=matched_metadata,
+                    tarinfo=data_file_tarinfo,
+                    fileobj=tarfle.extractfile(data_file_tarinfo),
+                    tarfile_name=os.path.basename(tarfle.name),
                 )
+                yield local_file
                 del tar_infos[data_file_tarinfo.name]
                 del metadata[matched_metadata["metadata_filename"]]
                 seen.add(filename)
+                report.report_matched(local_file)
         progress.log(
             f"Dangling metadata: {len(metadata)}, Dangling files: {len(tar_infos)}"
         )
@@ -165,29 +170,8 @@ def extract_metadata(
     cleanup_motion_videos(tar_infos, seen)
     if len(metadata):
         progress.log(f"[yellow]⚠ Metadata dangling: {len(metadata)}")
+        report.report_hanging_metadata(metadata=metadata)
     if len(tar_infos):
         progress.log(f"[yellow]⚠ Files dangling: {len(tar_infos)}")
+        report.report_hanging_files(tar_infos=tar_infos)
     progress.log(f"[green]Matched {len(seen)} files")
-    with open("missing.csv", "w") as fle:
-        writer = DictWriter(fle, fieldnames=("tar", "file", "state"))
-        writer.writeheader()
-        writer.writerows(
-            {"tar": data["tar_name"], "file": name, "state": "Metadata with no file"}
-            for name, data in metadata.items()
-        )
-        writer.writerows(
-            {
-                "tar": os.path.basename(the_tar.name),
-                "file": name,
-                "state": "Metadata Missing",
-            }
-            for name, (the_tar, _) in tar_infos.items()
-        )
-        writer.writerows({"tar": "?", "file": name, "state": "Done"} for name in seen)
-        # json.dump(
-        #     {
-        #         "metadata": list(metadata.keys()),
-        #         "files": list(tar_infos.keys()),
-        #     },
-        #     fle,
-        # )
