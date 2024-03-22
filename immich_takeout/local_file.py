@@ -21,6 +21,12 @@ class LocalFile(object):
         # NOTE: Assuming Google Takeout archive mtimes are UTC?
         self.last_modified = datetime.fromtimestamp(tarinfo.mtime, tz=timezone.utc)
         self.name = takeout_metadata.get("title") or self.filename_from_archive
+        if os.path.extsep not in self.name:
+            # Some files seem to have no file extension in the "title", but do in the original filename.
+            # Add it back in.
+            _, ext = os.path.splitext(self.filename_from_archive)
+            if ext:
+                self.name += ext
 
         # Metadata
         self.original_time = self.metadata_original_timestamp or self.last_modified
@@ -66,11 +72,9 @@ class LocalFile(object):
         return None
 
     @property
-    def asset_type(self):
-        mime, _ = mimetypes.guess_type(self.name, strict=False)
-        mime_type, mime_subtype = mime.split("/")
-        return mime_type.upper()
-
-    @property
     def file_extension(self):
         return os.path.splitext(self.name)[1]
+
+    @property
+    def is_archived(self) -> bool:
+        return self.filename_from_archive.startswith("Takeout/Google Photos/Archive/")

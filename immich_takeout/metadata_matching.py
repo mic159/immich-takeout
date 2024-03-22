@@ -56,7 +56,7 @@ def fix_truncated_name(filename, metadata) -> str:
     That means if the file extension is shorter than ".json", we need to recover data from
     within the metadata file and get the cut off characters.
     """
-    original_filename = metadata["title"]
+    original_filename = metadata.get("title", filename)
     if os.path.basename(filename) != original_filename and len(
         filename
     ) >= MAX_NAME_LENGTH - len(".json"):
@@ -157,7 +157,11 @@ def extract_metadata(
         progress.log(f"Processing [bold blue]{tar_name}")
         for tarinfo in iterate_tarfile(tar):
             filename, was_metadata = normalise_filename(tarinfo.name)
-            if filename in skip or filename.endswith("archive_browser.html"):
+            if (
+                filename in skip
+                or filename.endswith("archive_browser.html")
+                or filename.startswith("Takeout/Google Photos/Bin/")
+            ):
                 continue
             if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))

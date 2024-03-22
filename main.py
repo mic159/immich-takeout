@@ -35,7 +35,6 @@ TZ_GUESSER = tzwhere.tzwhere()
 MAX_NAME_LENGTH = 90
 
 # TODO:
-# CSV for report
 # Sidecar / XMP / XML building, to make it a single request
 # Concurrent uploading, queues
 
@@ -110,7 +109,7 @@ def process_files(
             if metadata_time != item.last_modified:
                 item.timestamp_differs = True
             progress.log(
-                f"{metadata_time.isoformat()} {'[bright_black]ORIG[/]'} - {os.path.basename(item.name)}"
+                f"{metadata_time.isoformat()} {'[bright_black]ORIG[/]'} - {item.name}"
             )
             yield item
             continue
@@ -135,7 +134,7 @@ def process_files(
         item.timestamp_differs = timestamp_differs
 
         progress.log(
-            f"{new_timestamp.isoformat()} {'[bright_magenta]UPDT[/]' if timestamp_differs else '[bright_black]ORIG[/]'} - {os.path.basename(item.name)}"
+            f"{new_timestamp.isoformat()} {'[bright_magenta]UPDT[/]' if timestamp_differs else '[bright_black]ORIG[/]'} - {item.name}"
         )
 
         yield item
@@ -276,11 +275,10 @@ def upload_files(
                 data={
                     "deviceAssetId": item.device_asset_id,
                     "deviceId": "gphotos-takeout-import",
-                    "assetType": item.asset_type,
                     "fileCreatedAt": item.original_time.isoformat(),
                     "fileModifiedAt": item.last_modified.isoformat(),
                     "isFavorite": "false",
-                    "fileExtension": item.file_extension.lstrip("."),
+                    "isArchived": str(item.is_archived).lower(),
                 },
                 timeout=60,
             )
