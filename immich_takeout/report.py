@@ -63,6 +63,43 @@ class Report:
             for name, (tar, _) in tar_infos.items()
         )
 
+    def report_skipped(self, filename: str, archive_filename: str, reason: str):
+        if not self.writer:
+            return
+        self.writer.writerow(
+            {
+                "file": filename,
+                "archive_file": archive_filename,
+                "state": f"Skipped, {reason}",
+            }
+        )
+
+    def report_unsupported_extension(self, fle: LocalFile):
+        if not self.writer:
+            return
+        self.writer.writerow(
+            {
+                "file": fle.filename_from_archive,
+                "archive_metadata": fle.takeout_metadata.get("tar_name"),
+                "archive_file": fle.archive_filename,
+                "state": "Skipped, Unsupported",
+                "photo_taken_time": fle.original_time.isoformat(),
+            }
+        )
+
+    def report_partner_sharing(self, fle: LocalFile):
+        if not self.writer:
+            return
+        self.writer.writerow(
+            {
+                "file": fle.filename_from_archive,
+                "archive_metadata": fle.takeout_metadata.get("tar_name"),
+                "archive_file": fle.archive_filename,
+                "state": "Skipped, Partner Sharing",
+                "photo_taken_time": fle.original_time.isoformat(),
+            }
+        )
+
     def close(self):
         if self.fle:
             self.fle.close()

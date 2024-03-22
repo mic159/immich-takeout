@@ -23,6 +23,7 @@ from rich.progress import (
     DownloadColumn,
     TransferSpeedColumn,
 )
+from rich.filesize import decimal
 
 from immich_takeout.processed_file_tracker import ProcessedFileTracker
 from immich_takeout.metadata_matching import extract_metadata
@@ -36,7 +37,8 @@ MAX_NAME_LENGTH = 90
 
 # TODO:
 # Sidecar / XMP / XML building, to make it a single request
-# Concurrent uploading, queues
+# Move Exif & image time guessing
+# Concurrent uploading, queueing
 
 
 def cli():
@@ -83,6 +85,7 @@ def cli():
                         report=report,
                     ),
                     progress=progress,
+                    report=report,
                 ),
                 api_key=args.api_key,
                 api_url=args.api_url,
@@ -96,11 +99,12 @@ def cli():
 
 
 def process_files(
-    items: Iterator[LocalFile], progress: Progress
+    items: Iterator[LocalFile], progress: Progress, report: Report
 ) -> Iterator[LocalFile]:
     for item in progress.track(items, description="Processing files"):
         # Filter to only your images
         if item.is_from_partner_sharing:
+            report.report_partner_sharing(item)
             continue
 
         metadata_time = item.metadata_original_timestamp
@@ -108,8 +112,12 @@ def process_files(
         if item.file_extension.lower() not in (".jpeg", ".jpg"):
             if metadata_time != item.last_modified:
                 item.timestamp_differs = True
+            if item.file_extension.lower() in (".vob", ".thm"):
+                progress.log(f"[red]Skipping unsupported file extension {item.name}")
+                report.report_unsupported_extension(item)
+                continue
             progress.log(
-                f"{metadata_time.isoformat()} {'[bright_black]ORIG[/]'} - {item.name}"
+                f"{metadata_time.isoformat()} {'[bright_black]ORIG[/]'} - {item.name} - {decimal(item.file_size)}"
             )
             yield item
             continue
@@ -134,7 +142,7 @@ def process_files(
         item.timestamp_differs = timestamp_differs
 
         progress.log(
-            f"{new_timestamp.isoformat()} {'[bright_magenta]UPDT[/]' if timestamp_differs else '[bright_black]ORIG[/]'} - {item.name}"
+            f"{new_timestamp.isoformat()} {'[bright_magenta]UPDT[/]' if timestamp_differs else '[bright_black]ORIG[/]'} - {item.name} - {decimal(item.file_size)}"
         )
 
         yield item
@@ -194,9 +202,13 @@ def check_timestamp_exif(
 def extract_exif_date(exif_data) -> datetime | None:
     if ExifIFD.DateTimeOriginal not in exif_data["Exif"]:
         return None
-    exif_time = datetime.strptime(
-        exif_data["Exif"][ExifIFD.DateTimeOriginal].decode("ascii"), DATETIME_STR_FORMAT
-    )
+    try:
+        exif_time = datetime.strptime(
+            exif_data["Exif"][ExifIFD.DateTimeOriginal].decode("ascii"),
+            DATETIME_STR_FORMAT,
+        )
+    except ValueError:
+        return None
     if ExifIFD.OffsetTimeOriginal in exif_data["Exif"]:
         tz = parse_timezone(
             exif_data["Exif"][ExifIFD.OffsetTimeOriginal].decode("ascii")
@@ -210,7 +222,10 @@ def extract_exif_gps(exif_data) -> tuple[float, float] | None:
         return None
     if GPSIFD.GPSLatitude not in exif_data["GPS"]:
         return None
-    return dms_to_dd(exif_data["GPS"])
+    try:
+        return dms_to_dd(exif_data["GPS"])
+    except ZeroDivisionError:
+        return None
 
 
 def dms_to_dd(gps_exif) -> tuple[float, float]:
@@ -253,8 +268,8 @@ def upload_files(
         "https://",
         HTTPAdapter(
             max_retries=Retry(
-                total=20,
-                backoff_factor=10,
+                total=2,
+                backoff_factor=1,
                 allowed_methods=("GET", "HEAD", "POST"),
                 status_forcelist=[500, 502, 503, 504, 408, 429],
             ),
@@ -264,6 +279,7 @@ def upload_files(
     for item in files:
         if not dry_run:
             item.file_obj.seek(0)
+            # with progress.console.status()
             response = session.request(
                 "POST",
                 url=os.path.join(api_url, "api/asset/upload"),
@@ -290,9 +306,11 @@ def upload_files(
                 data = response.json()
                 skip.add(item.filename_from_archive)
                 if data["duplicate"]:
-                    progress.log(f"[yellow]Duplicate[/yellow] {item.name}")
+                    progress.log(f"[yellow]Duplicate rejected[/yellow] {item.name}")
                 else:
-                    progress.log(f"✔ Uploaded {item.name}")
+                    progress.log(
+                        f"[green]✔ Uploaded[/green] {decimal(item.file_size)} in {response.elapsed}"
+                    )
                     if item.timestamp_differs:
                         update_asset_metadata(
                             session=session,

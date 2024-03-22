@@ -162,6 +162,14 @@ def extract_metadata(
                 or filename.endswith("archive_browser.html")
                 or filename.startswith("Takeout/Google Photos/Bin/")
             ):
+                if not was_metadata:
+                    report.report_skipped(
+                        filename=filename,
+                        archive_filename=os.path.basename(tar.name),
+                        reason="In skip file"
+                        if filename in skip
+                        else "Ignored/Trash file",
+                    )
                 continue
             if was_metadata:
                 data = json.load(tar.extractfile(tarinfo))
